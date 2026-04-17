@@ -74,12 +74,5 @@ except Exception as e:
 
 # 启动连接
 logger.info("启动钉钉机器人...")
-try:
-    channel.connect()
-except KeyboardInterrupt:
-    logger.info("收到中断信号，停止服务")
-    channel.disconnect()
-except Exception as e:
-    logger.error(f"运行错误: {e}")
-    channel.disconnect()
-    sys.exit(1)
+channel.connect()
+logger.info("服务已停止")

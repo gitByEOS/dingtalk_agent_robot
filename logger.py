@@ -187,3 +187,55 @@ def log_interaction(
         user_id, user_name, msg_id, chat_id,
         is_group, is_mentioned, user_input, agent_reply, duration_ms
     )
+
+
+def dump_conversations(logs_dir: str):
+    """
+    打印目录下所有对话日志
+
+    格式: time + user_talk + agent_talk
+    """
+    logs_path = Path(logs_dir)
+    if not logs_path.exists():
+        print(f"目录不存在: {logs_dir}")
+        return
+
+    log_files = sorted(logs_path.rglob("*.log"))
+    if not log_files:
+        print(f"无日志文件: {logs_dir}")
+        return
+
+    for log_file in log_files:
+        user_id = log_file.parent.name
+        date = log_file.stem
+        print(f"\n=== {user_id} / {date} ===")
+
+        with open(log_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    ts = record.get("timestamp", "")
+                    user_input = record.get("user_input", "")
+                    agent_reply = record.get("agent_reply", "")
+
+                    # 只显示时间部分 (去掉毫秒)
+                    time_str = ts.split(".")[0] if ts else ""
+
+                    print(f"\n[{time_str}]")
+                    print(f"用户: {user_input}")
+                    print(f"回复: {agent_reply}")
+                except json.JSONDecodeError:
+                    continue
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="交互日志工具")
+    parser.add_argument("--dump", metavar="DIR", help="打印目录下所有对话日志")
+    args = parser.parse_args()
+
+    if args.dump:
+        dump_conversations(args.dump)

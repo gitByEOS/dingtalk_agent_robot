@@ -23,6 +23,7 @@ import asyncio
 import tempfile
 import uuid
 import logging
+import threading
 import requests
 from typing import Optional, Dict, List, Any, Callable
 from dataclasses import dataclass, field
@@ -41,6 +42,14 @@ from dingtalk_stream import (
 
 # 常量
 DOWNLOAD_API = "https://api.dingtalk.com/v1.0/robot/messageFiles/download"
+
+# 消息类型处理器
+MSGTYPE_HANDLERS = {
+    'picture': lambda c: ('(image)', [c.get('downloadCode')], 'image', None),
+    'file': lambda c: (f"(file: {c.get('fileName') or 'file'})", [c.get('downloadCode')], 'file', c.get('fileName')),
+    'audio': lambda c: (c.get('recognition') or '(audio)', [c.get('downloadCode')], 'audio', None),
+    'video': lambda c: ('(video)', [c.get('downloadCode')], 'video', None),
+}
 
 
 # --- 数据结构 ---
@@ -65,21 +74,18 @@ class Attachment:
 
 @dataclass
 class Envelope:
-    """
-    消息信封 - 包含完整的消息上下文信息
-    类似 dingtalk-js 的 Envelope 结构
-    """
+    """消息信封"""
     channel_name: str = ""
     sender_id: str = ""
     sender_name: str = "Unknown"
-    chat_id: str = ""  # 业务会话标识，优先使用 conversationId
+    chat_id: str = ""
     conversation_id: str = ""
     session_webhook: str = ""
     text: str = ""
     is_group: bool = False
     is_mentioned: bool = False
     is_reply_to_bot: bool = False
-    referenced_text: Optional[str] = None  # 引用消息内容
+    referenced_text: Optional[str] = None
     message_id: Optional[str] = None
     attachments: List[Attachment] = field(default_factory=list)
 
@@ -88,23 +94,12 @@ class Envelope:
 
 
 def download_media(download_code: str, robot_code: str, access_token: str) -> Optional[MediaFile]:
-    """
-    下载钉钉媒体文件（两步流程）
-
-    Args:
-        download_code: 消息中的下载码
-        robot_code: 机器人的 clientId (AppKey)
-        access_token: 钉钉 Access Token
-
-    Returns:
-        MediaFile 或 None
-    """
+    """下载钉钉媒体文件"""
     if not download_code or not robot_code or not access_token:
         return None
 
     try:
-        # Step 1: 获取下载 URL
-        api_resp = requests.post(
+        resp = requests.post(
             DOWNLOAD_API,
             headers={
                 "x-acs-dingtalk-access-token": access_token,
@@ -113,60 +108,32 @@ def download_media(download_code: str, robot_code: str, access_token: str) -> Op
             json={"downloadCode": download_code, "robotCode": robot_code},
             timeout=30
         )
-
-        if api_resp.status_code != 200:
-            print(f"获取下载URL失败: HTTP {api_resp.status_code}")
+        if resp.status_code != 200:
             return None
 
-        payload = api_resp.json()
+        payload = resp.json()
         download_url = payload.get("downloadUrl") or payload.get("data", {}).get("downloadUrl")
-
         if not download_url:
-            print("响应中无 downloadUrl")
             return None
 
-        # Step 2: 下载文件
         file_resp = requests.get(download_url, timeout=60)
         if file_resp.status_code != 200:
-            print(f"下载文件失败: HTTP {file_resp.status_code}")
             return None
 
-        mime_type = file_resp.headers.get("Content-Type", "application/octet-stream")
-        return MediaFile(data=file_resp.content, mime_type=mime_type)
-
-    except Exception as e:
-        print(f"下载媒体异常: {e}")
+        return MediaFile(data=file_resp.content, mime_type=file_resp.headers.get("Content-Type", "application/octet-stream"))
+    except Exception:
         return None
 
 
-# --- DingtalkChannel 类 ---
+# --- DingtalkChannel ---
 
 
 class DingtalkChannel:
-    """
-    钉钉机器人适配器 - 完整实现
-
-    功能：
-    1. 通过 dingtalk-stream SDK 连接钉钉 Stream
-    2. 消息接收和解析
-    3. Webhook 缓存用于回复
-    4. 媒体下载和附件处理
-    5. 引用消息上下文提取
-    6. 表情回复
-    """
+    """钉钉机器人适配器"""
 
     def __init__(self, client_id: str, client_secret: str,
                  message_handler: Optional[Callable[[Envelope], None]] = None,
                  logger: Optional[logging.Logger] = None):
-        """
-        初始化 DingtalkChannel
-
-        Args:
-            client_id: 钉钉机器人 AppKey
-            client_secret: 钉钉机器人 AppSecret
-            message_handler: 消息处理回调函数，接收 Envelope
-            logger: 日志记录器
-        """
         if not client_id or not client_secret:
             raise ValueError("需要提供 client_id 和 client_secret")
 
@@ -175,196 +142,145 @@ class DingtalkChannel:
         self.message_handler = message_handler
         self.logger = logger or logging.getLogger('dingtalk_channel')
 
+        # 停止信号
+        self._stop_event = threading.Event()
+
         # Stream 客户端
         self.credential = Credential(client_id, client_secret)
         self.client = DingTalkStreamClient(self.credential, self.logger)
 
-        # Webhook 缓存: conversationId → sessionWebhook
+        # Webhook 缓存
         self.webhooks: Dict[str, str] = {}
         self.worker_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dingtalk-worker")
 
         # 注册回调处理器
         self.handler = DingtalkCallbackHandler(self)
-        self.client.register_callback_handler(
-            dingtalk_stream.ChatbotMessage.TOPIC,
-            self.handler
-        )
+        self.client.register_callback_handler(dingtalk_stream.ChatbotMessage.TOPIC, self.handler)
 
     def connect(self):
         """连接钉钉 Stream"""
-        self.logger.info("[DingTalk] Connecting via stream...")
-        try:
-            self.client.start_forever()
-        finally:
-            self.disconnect()
+        self.logger.info("[DingTalk] Connecting...")
+        self._stop_event.clear()
+
+        # 在后台线程启动 SDK
+        self._thread = threading.Thread(target=self.client.start_forever, daemon=True)
+        self._thread.start()
+
+        # 等待停止信号
+        while not self._stop_event.wait(0.5):
+            pass
+
+        # 关闭 websocket 让 SDK 循环退出
+        self._close_websocket()
+        self._thread.join(timeout=3)
+        self._cleanup()
 
     def disconnect(self):
-        """断开连接并清理后台任务"""
-        self.worker_pool.shutdown(wait=False)
+        """触发停止"""
+        self._stop_event.set()
 
-        websocket = getattr(self.client, "websocket", None)
-        if not websocket:
+    def _close_websocket(self):
+        """关闭 websocket 连接"""
+        ws = getattr(self.client, 'websocket', None)
+        if not ws:
             return
 
         try:
-            asyncio.run(websocket.close())
-        except RuntimeError:
             loop = asyncio.new_event_loop()
-            try:
-                loop.run_until_complete(websocket.close())
-            finally:
-                loop.close()
-        except Exception as e:
-            self.logger.warning(f"[DingTalk] 关闭 websocket 失败: {e}")
+            loop.run_until_complete(ws.close())
+            loop.close()
+        except Exception:
+            pass
+
+    def _cleanup(self):
+        """清理资源"""
+        self.worker_pool.shutdown(wait=False)
 
     def get_access_token(self) -> Optional[str]:
-        """获取钉钉 Access Token"""
         return self.client.get_access_token()
 
     def send_message(self, chat_id: str, text: str) -> bool:
-        """
-        发送消息到指定会话
-
-        Args:
-            chat_id: conversationId
-            text: Markdown 文本
-
-        Returns:
-            是否发送成功
-        """
         webhook = self.webhooks.get(chat_id)
         if not webhook and chat_id.startswith("https://"):
             webhook = chat_id
         if not webhook:
-            self.logger.error(f"[DingTalk] No webhook for chat_id {chat_id}, cannot send.")
+            self.logger.error(f"[DingTalk] No webhook for {chat_id}")
             return False
-
         return send_markdown(webhook, text)
 
     def reply(self, envelope: Envelope, text: str) -> bool:
-        """根据消息信封回复消息"""
         webhook = envelope.session_webhook or self.webhooks.get(envelope.conversation_id or envelope.chat_id)
         if not webhook:
-            self.logger.error(f"[DingTalk] No webhook for envelope chat_id {envelope.chat_id}, cannot reply.")
+            self.logger.error(f"[DingTalk] No webhook for envelope")
             return False
         return send_markdown(webhook, text)
 
     def attach_reaction(self, msg_id: Optional[str], conversation_id: str):
-        """添加表情反应"""
         token = self.get_access_token()
         if token and msg_id and conversation_id:
             send_emotion(token, self.client_id, msg_id, conversation_id, "reply")
 
     def recall_reaction(self, msg_id: Optional[str], conversation_id: str):
-        """移除表情反应"""
         token = self.get_access_token()
         if token and msg_id and conversation_id:
             send_emotion(token, self.client_id, msg_id, conversation_id, "recall")
 
     def _extract_content(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        从钉钉消息提取内容和媒体信息
-
-        Returns:
-            {
-                'text': str,
-                'download_codes': List[str],
-                'media_type': Optional[str],
-                'file_name': Optional[str]
-            }
-        """
+        """从钉钉消息提取内容和媒体信息"""
         msgtype = data.get('msgtype', 'text')
         content = data.get('content', {})
         text_data = data.get('text', {})
 
-        result = {
-            'text': '',
-            'download_codes': [],
-            'media_type': None,
-            'file_name': None
-        }
+        # 媒体类型：用处理器映射
+        handler = MSGTYPE_HANDLERS.get(msgtype)
+        if handler:
+            text, codes, media_type, file_name = handler(content)
+            return {'text': text, 'download_codes': codes, 'media_type': media_type, 'file_name': file_name}
 
+        # richText：特殊处理
         if msgtype == 'richText':
             rich_text = content.get('richText', [])
             text_parts = []
             codes = []
             for part in rich_text:
-                part_type = part.get('type', 'text')
-                if part_type == 'text' and part.get('text'):
+                if part.get('type') == 'text' and part.get('text'):
                     text_parts.append(part['text'])
-                elif part_type == 'picture' and part.get('downloadCode'):
+                elif part.get('type') == 'picture' and part.get('downloadCode'):
                     codes.append(part['downloadCode'])
+            return {
+                'text': ''.join(text_parts).strip() or ('(image)' if codes else ''),
+                'download_codes': codes,
+                'media_type': 'image' if codes else None,
+                'file_name': None
+            }
 
-            result['text'] = ''.join(text_parts).strip() or ('(image)' if codes else '')
-            result['download_codes'] = codes
-            result['media_type'] = 'image' if codes else None
-
-        elif msgtype == 'picture':
-            code = content.get('downloadCode')
-            result['text'] = '(image)'
-            result['download_codes'] = [code] if code else []
-            result['media_type'] = 'image'
-
-        elif msgtype == 'file':
-            code = content.get('downloadCode')
-            file_name = content.get('fileName')
-            result['text'] = f"(file: {file_name or 'file'})"
-            result['download_codes'] = [code] if code else []
-            result['media_type'] = 'file'
-            result['file_name'] = file_name
-
-        elif msgtype == 'audio':
-            code = content.get('downloadCode')
-            recognition = content.get('recognition')
-            result['text'] = recognition or '(audio)'
-            result['download_codes'] = [code] if code else []
-            result['media_type'] = 'audio'
-
-        elif msgtype == 'video':
-            code = content.get('downloadCode')
-            result['text'] = '(video)'
-            result['download_codes'] = [code] if code else []
-            result['media_type'] = 'video'
-
-        else:
-            # 默认文本消息
-            result['text'] = text_data.get('content', '').strip()
-
-        return result
+        # 默认文本
+        return {'text': text_data.get('content', '').strip(), 'download_codes': [], 'media_type': None, 'file_name': None}
 
     def _extract_quoted_context(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        提取引用消息上下文
-
-        Returns:
-            {
-                'referenced_text': Optional[str],
-                'is_reply_to_bot': bool
-            }
-        """
+        """提取引用消息上下文"""
         chatbot_user_id = data.get('chatbotUserId')
-        result = {'referenced_text': None, 'is_reply_to_bot': False}
-
-        # 新格式: text.repliedMsg
         text_data = data.get('text', {})
+
+        # 统一处理新旧格式
+        replied = None
         if text_data.get('isReplyMsg') and text_data.get('repliedMsg'):
             replied = text_data['repliedMsg']
-            sender_id = replied.get('senderId')
-            result['is_reply_to_bot'] = bool(chatbot_user_id and sender_id == chatbot_user_id)
-            result['referenced_text'] = self._summarize_replied_content(replied)
-
-        # 旧格式: quoteMessage
+            text_content = self._summarize_replied_content(replied)
         elif data.get('quoteMessage'):
-            quote = data['quoteMessage']
-            sender_id = quote.get('senderId')
-            result['is_reply_to_bot'] = bool(chatbot_user_id and sender_id == chatbot_user_id)
-            result['referenced_text'] = quote.get('text', {}).get('content', '').strip()
+            replied = data['quoteMessage']
+            text_content = replied.get('text', {}).get('content', '').strip()
+        else:
+            return {'referenced_text': None, 'is_reply_to_bot': False}
 
-        return result
+        sender_id = replied.get('senderId')
+        return {
+            'referenced_text': text_content,
+            'is_reply_to_bot': bool(chatbot_user_id and sender_id == chatbot_user_id)
+        }
 
     def _summarize_replied_content(self, replied: Dict[str, Any]) -> Optional[str]:
         """总结回复消息内容"""
-        msg_type = replied.get('msgType')
         content = replied.get('content', {})
 
         # 直接文本
@@ -375,33 +291,29 @@ class DingtalkChannel:
         if content.get('richText'):
             parts = []
             for part in content['richText']:
-                part_type = part.get('type', 'text')
-                if part_type == 'text' and part.get('text'):
+                ptype = part.get('type', 'text')
+                if ptype == 'text' and part.get('text'):
                     parts.append(part['text'])
-                elif part_type == 'picture':
+                elif ptype == 'picture':
                     parts.append('[image]')
-                elif part_type == 'at' and part.get('atName'):
+                elif ptype == 'at' and part.get('atName'):
                     parts.append(f"@{part['atName']}")
             return ''.join(parts).strip() if parts else None
 
         # 媒体类型
-        if msg_type == 'picture':
-            return '[image]'
-        elif msg_type == 'file':
+        msg_type = replied.get('msgType')
+        media_map = {'picture': '[image]', 'audio': '[audio]', 'video': '[video]'}
+        if msg_type in media_map:
+            return media_map[msg_type]
+        if msg_type == 'file':
             return f"[file: {content.get('fileName', 'file')}]"
-        elif msg_type == 'audio':
-            return '[audio]'
-        elif msg_type == 'video':
-            return '[video]'
 
         return None
 
-    def _attach_media(self, envelope: Envelope, download_code: str,
-                      media_type: str, file_name: Optional[str] = None):
-        """下载媒体文件并附加到 envelope"""
+    def _attach_media(self, envelope: Envelope, download_code: str, media_type: str, file_name: Optional[str] = None):
+        """下载媒体并附加到 envelope"""
         token = self.get_access_token()
         if not token:
-            self.logger.error("[DingTalk] Cannot download media: missing token")
             return
 
         media = download_media(download_code, self.client_id, token)
@@ -416,7 +328,6 @@ class DingtalkChannel:
                 mime_type=mime
             ))
         else:
-            # 保存非图片文件到临时目录
             dir_path = os.path.join(tempfile.gettempdir(), 'channel-files', str(uuid.uuid4()))
             os.makedirs(dir_path, exist_ok=True)
             safe_name = file_name or f"dingtalk_{media_type}_{int(time.time())}"
@@ -425,7 +336,6 @@ class DingtalkChannel:
             with open(file_path, 'wb') as f:
                 f.write(media.data)
 
-            # 清理占位符文本
             placeholder_texts = ['(audio)', '(video)', f"(file: {file_name or 'file'})"]
             if envelope.text in placeholder_texts:
                 envelope.text = ''
@@ -438,41 +348,30 @@ class DingtalkChannel:
             ))
 
     def process_message(self, incoming_message: ChatbotMessage):
-        """
-        处理接收到的消息
-
-        Args:
-            incoming_message: dingtalk_stream 的 ChatbotMessage
-        """
+        """处理接收到的消息"""
         try:
             msg_id = incoming_message.message_id
-
             conversation_type = incoming_message.conversation_type
             session_webhook = incoming_message.session_webhook
             conversation_id = incoming_message.conversation_id
 
             if not session_webhook:
-                self.logger.warning("[DingTalk] No sessionWebhook in message, skipping.")
+                self.logger.warning("[DingTalk] No sessionWebhook, skipping.")
                 return
 
-            # 缓存 webhook
             if conversation_id:
                 self.webhooks[conversation_id] = session_webhook
 
             is_group = conversation_type == '2'
             is_mentioned = bool(incoming_message.is_in_at_list)
 
-            # 提取内容
             content = self._extract_content(incoming_message.to_dict())
             clean_text = content['text']
 
-            # 移除 @机器人
             if is_mentioned:
                 clean_text = re.sub(r'@\S+', '', clean_text).strip()
 
-            # 提取引用上下文
             quoted = self._extract_quoted_context(incoming_message.to_dict())
-
             chat_id = conversation_id or session_webhook
 
             envelope = Envelope(
@@ -490,35 +389,26 @@ class DingtalkChannel:
                 message_id=msg_id
             )
 
-            try:
-                # 下载媒体
-                if content['download_codes'] and content['media_type']:
-                    code = content['download_codes'][0]
-                    self._attach_media(envelope, code, content['media_type'], content['file_name'])
+            if content['download_codes'] and content['media_type']:
+                self._attach_media(envelope, content['download_codes'][0], content['media_type'], content['file_name'])
 
-                # 调用消息处理器
-                if self.message_handler:
-                    self.message_handler(envelope)
-                else:
-                    self.logger.info(f"[DingTalk] Received message: {envelope.text[:50]}...")
-            except Exception as e:
-                self.logger.error(f"[DingTalk] Error in message handler: {e}")
+            if self.message_handler:
+                self.message_handler(envelope)
+            else:
+                self.logger.info(f"[DingTalk] Received: {envelope.text[:50]}...")
 
         except Exception as e:
-            self.logger.error(f"[DingTalk] Failed to process message: {e}")
+            self.logger.error(f"[DingTalk] Process error: {e}")
 
 
 class DingtalkCallbackHandler(ChatbotHandler):
-    """
-    自定义回调处理器 - 将消息转发给 DingtalkChannel
-    """
+    """回调处理器"""
 
     def __init__(self, channel: DingtalkChannel):
         super().__init__()
         self.channel = channel
 
     def process(self, callback_message: CallbackMessage):
-        """处理回调消息"""
         try:
             incoming_message = ChatbotMessage.from_dict(callback_message.data)
             self.channel.worker_pool.submit(self.channel.process_message, incoming_message)
@@ -528,17 +418,16 @@ class DingtalkCallbackHandler(ChatbotHandler):
             return AckMessage.STATUS_NOT_IMPLEMENT, str(e)
 
 
-# --- CLI 入口 ---
+# --- CLI ---
 
 
 def main():
     import argparse
-
     parser = argparse.ArgumentParser(description="钉钉机器人消息发送工具")
-    parser.add_argument("-w", "--webhook", required=True, help="钉钉机器人 Webhook URL")
+    parser.add_argument("-w", "--webhook", required=True, help="Webhook URL")
     parser.add_argument("-m", "--message", required=True, help="消息内容")
-    parser.add_argument("-t", "--title", help="消息标题")
-    parser.add_argument("--type", choices=["markdown", "text"], default="markdown", help="消息类型")
+    parser.add_argument("-t", "--title", help="标题")
+    parser.add_argument("--type", choices=["markdown", "text"], default="markdown")
 
     args = parser.parse_args()
 

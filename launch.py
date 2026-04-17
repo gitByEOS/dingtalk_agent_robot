@@ -49,13 +49,13 @@ def main():
     def signal_handler(sig, frame):
         logger.info("[DingTalk] 收到中断信号，正在停止...")
         service.disconnect()
-        sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # 运行服务
+    # 运行服务（connect 内部会等待停止信号）
     service.connect()
+    logger.info("[DingTalk] 服务已停止")
 
 
 if __name__ == "__main__":
