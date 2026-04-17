@@ -48,7 +48,8 @@ def main():
     # 信号处理 - 优雅退出
     def signal_handler(sig, frame):
         logger.info("[DingTalk] 收到中断信号，正在停止...")
-        os._exit(0)
+        service.disconnect()
+        sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)

@@ -140,6 +140,8 @@ def load_skills(skills_dir: Path) -> list:
 def build_system_prompt(rules_dir: Path, skills_dir: Path) -> str:
     """组合系统提示词"""
     parts = []
+    parts.append("你是一个Losta项目组的Agent，能帮你处理一些简单的任务。")
+
     rules = load_rules(rules_dir)
     skills = load_skills(skills_dir)
 

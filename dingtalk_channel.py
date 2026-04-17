@@ -6,33 +6,30 @@ DingTalk Channel - 钉钉机器人适配器
 核心功能：
 1. 通过 dingtalk-stream SDK 连接钉钉 Stream
 2. 消息接收和解析（text, richText, picture, file, audio, video）
-3. 消息去重（防止重试导致重复处理）
-4. Markdown 格式化（表格转换、消息分块）
-5. 媒体文件下载和附件处理
-6. 引用消息上下文提取
-7. 表情回复（👀 表示正在处理）
-8. Webhook 缓存用于回复消息
+3. Markdown 格式化（表格转换、消息分块）
+4. 媒体文件下载和附件处理
+5. 引用消息上下文提取
+6. 表情回复（👀 表示正在处理）
+7. Webhook 缓存用于回复消息
 
 参考: dingtalk-js/src/DingtalkAdapter.ts
 """
 
-import json
 import re
 import os
 import time
+import base64
+import asyncio
 import tempfile
 import uuid
-import hashlib
 import logging
-import asyncio
 import requests
 from typing import Optional, Dict, List, Any, Callable
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
 
-from dingtalk_utils import send_emotion, send_markdown, send_text_message, normalize_dingtalk_markdown
+from dingtalk_utils import send_emotion, send_markdown, send_text_message
 import dingtalk_stream
-import websockets
 from dingtalk_stream import (
     DingTalkStreamClient,
     Credential,
@@ -43,13 +40,7 @@ from dingtalk_stream import (
 )
 
 # 常量
-CHUNK_LIMIT = 3800  # 钉钉消息最大长度
-DEDUP_TTL_MS = 5 * 60 * 1000  # 去重 TTL 5分钟
 DOWNLOAD_API = "https://api.dingtalk.com/v1.0/robot/messageFiles/download"
-EMOTION_API = "https://api.dingtalk.com/v1.0/robot/emotion"
-ACK_REACTION_NAME = "get✓" #👀
-ACK_EMOTION_ID = "2659900"
-ACK_EMOTION_BG_ID = "im_bg_1"
 
 
 # --- 数据结构 ---
@@ -81,7 +72,9 @@ class Envelope:
     channel_name: str = ""
     sender_id: str = ""
     sender_name: str = "Unknown"
-    chat_id: str = ""  # conversationId 或 sessionWebhook
+    chat_id: str = ""  # 业务会话标识，优先使用 conversationId
+    conversation_id: str = ""
+    session_webhook: str = ""
     text: str = ""
     is_group: bool = False
     is_mentioned: bool = False
@@ -156,11 +149,10 @@ class DingtalkChannel:
     功能：
     1. 通过 dingtalk-stream SDK 连接钉钉 Stream
     2. 消息接收和解析
-    3. 消息去重
-    4. Webhook 缓存用于回复
-    5. 媒体下载和附件处理
-    6. 引用消息上下文提取
-    7. 表情回复
+    3. Webhook 缓存用于回复
+    4. 媒体下载和附件处理
+    5. 引用消息上下文提取
+    6. 表情回复
     """
 
     def __init__(self, client_id: str, client_secret: str,
@@ -187,17 +179,9 @@ class DingtalkChannel:
         self.credential = Credential(client_id, client_secret)
         self.client = DingTalkStreamClient(self.credential, self.logger)
 
-        # 消息去重
-        self.seen_messages: Dict[str, int] = {}
-
         # Webhook 缓存: conversationId → sessionWebhook
         self.webhooks: Dict[str, str] = {}
-
-        # 反应上下文: messageId → conversationId
-        self.reaction_context: Dict[str, str] = {}
-
-        # 正在处理的消息
-        self.processing_messages: Dict[str, bool] = {}
+        self.worker_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dingtalk-worker")
 
         # 注册回调处理器
         self.handler = DingtalkCallbackHandler(self)
@@ -209,12 +193,29 @@ class DingtalkChannel:
     def connect(self):
         """连接钉钉 Stream"""
         self.logger.info("[DingTalk] Connecting via stream...")
-        self.client.start_forever()
+        try:
+            self.client.start_forever()
+        finally:
+            self.disconnect()
 
     def disconnect(self):
-        """断开连接"""
-        # dingtalk_stream SDK 的 stop 方法
-        pass
+        """断开连接并清理后台任务"""
+        self.worker_pool.shutdown(wait=False)
+
+        websocket = getattr(self.client, "websocket", None)
+        if not websocket:
+            return
+
+        try:
+            asyncio.run(websocket.close())
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(websocket.close())
+            finally:
+                loop.close()
+        except Exception as e:
+            self.logger.warning(f"[DingTalk] 关闭 websocket 失败: {e}")
 
     def get_access_token(self) -> Optional[str]:
         """获取钉钉 Access Token"""
@@ -232,56 +233,33 @@ class DingtalkChannel:
             是否发送成功
         """
         webhook = self.webhooks.get(chat_id)
+        if not webhook and chat_id.startswith("https://"):
+            webhook = chat_id
         if not webhook:
             self.logger.error(f"[DingTalk] No webhook for chat_id {chat_id}, cannot send.")
             return False
 
         return send_markdown(webhook, text)
 
-    def _attach_reaction(self, msg_id: str, conversation_id: str):
+    def reply(self, envelope: Envelope, text: str) -> bool:
+        """根据消息信封回复消息"""
+        webhook = envelope.session_webhook or self.webhooks.get(envelope.conversation_id or envelope.chat_id)
+        if not webhook:
+            self.logger.error(f"[DingTalk] No webhook for envelope chat_id {envelope.chat_id}, cannot reply.")
+            return False
+        return send_markdown(webhook, text)
+
+    def attach_reaction(self, msg_id: Optional[str], conversation_id: str):
         """添加表情反应"""
         token = self.get_access_token()
-        if token:
+        if token and msg_id and conversation_id:
             send_emotion(token, self.client_id, msg_id, conversation_id, "reply")
 
-    def _recall_reaction(self, msg_id: str, conversation_id: str):
+    def recall_reaction(self, msg_id: Optional[str], conversation_id: str):
         """移除表情反应"""
         token = self.get_access_token()
-        if token:
+        if token and msg_id and conversation_id:
             send_emotion(token, self.client_id, msg_id, conversation_id, "recall")
-
-    def _on_prompt_start(self, msg_id: str):
-        """开始处理消息时调用"""
-        conv_id = self.reaction_context.get(msg_id)
-        if conv_id:
-            self._attach_reaction(msg_id, conv_id)
-
-    def _on_prompt_end(self, msg_id: str):
-        """处理完成时调用"""
-        conv_id = self.reaction_context.get(msg_id)
-        if conv_id:
-            self._recall_reaction(msg_id, conv_id)
-            self.reaction_context.pop(msg_id, None)
-
-    def _dedup_check(self, msg_id: str) -> bool:
-        """
-        消息去重检查
-
-        Returns:
-            True 表示消息已处理过（跳过），False 表示新消息
-        """
-        now = int(time.time() * 1000)
-        if msg_id in self.seen_messages:
-            return True
-        self.seen_messages[msg_id] = now
-        return False
-
-    def _cleanup_dedup(self):
-        """清理过期的去重记录"""
-        now = int(time.time() * 1000)
-        expired = [k for k, v in self.seen_messages.items() if now - v > DEDUP_TTL_MS]
-        for k in expired:
-            self.seen_messages.pop(k)
 
     def _extract_content(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -434,7 +412,7 @@ class DingtalkChannel:
             mime = media.mime_type if media.mime_type.startswith('image/') else 'image/jpeg'
             envelope.attachments.append(Attachment(
                 type='image',
-                data=media.data.decode('base64'),  # 需要转 base64
+                data=base64.b64encode(media.data).decode('ascii'),
                 mime_type=mime
             ))
         else:
@@ -469,10 +447,6 @@ class DingtalkChannel:
         try:
             msg_id = incoming_message.message_id
 
-            # 去重检查
-            if msg_id and self._dedup_check(msg_id):
-                return
-
             conversation_type = incoming_message.conversation_type
             session_webhook = incoming_message.session_webhook
             conversation_id = incoming_message.conversation_id
@@ -506,6 +480,8 @@ class DingtalkChannel:
                 sender_id=incoming_message.sender_staff_id or incoming_message.sender_id or '',
                 sender_name=incoming_message.sender_nick or 'Unknown',
                 chat_id=chat_id,
+                conversation_id=conversation_id or '',
+                session_webhook=session_webhook or '',
                 text=clean_text or content['text'],
                 is_group=is_group,
                 is_mentioned=is_mentioned,
@@ -514,30 +490,19 @@ class DingtalkChannel:
                 message_id=msg_id
             )
 
-            # 存储反应上下文
-            if msg_id and conversation_id:
-                self.reaction_context[msg_id] = conversation_id
+            try:
+                # 下载媒体
+                if content['download_codes'] and content['media_type']:
+                    code = content['download_codes'][0]
+                    self._attach_media(envelope, code, content['media_type'], content['file_name'])
 
-            # 下载媒体
-            if content['download_codes'] and content['media_type']:
-                code = content['download_codes'][0]
-                self._attach_media(envelope, code, content['media_type'], content['file_name'])
-
-            # 添加表情反应
-            self._on_prompt_start(msg_id)
-
-            # 调用消息处理器
-            if self.message_handler:
-                try:
+                # 调用消息处理器
+                if self.message_handler:
                     self.message_handler(envelope)
-                except Exception as e:
-                    self.logger.error(f"[DingTalk] Error in message handler: {e}")
-                    self.send_message(chat_id, "Sorry, something went wrong processing your message.")
-            else:
-                self.logger.info(f"[DingTalk] Received message: {envelope.text[:50]}...")
-
-            # 移除表情反应
-            self._on_prompt_end(msg_id)
+                else:
+                    self.logger.info(f"[DingTalk] Received message: {envelope.text[:50]}...")
+            except Exception as e:
+                self.logger.error(f"[DingTalk] Error in message handler: {e}")
 
         except Exception as e:
             self.logger.error(f"[DingTalk] Failed to process message: {e}")
@@ -556,7 +521,7 @@ class DingtalkCallbackHandler(ChatbotHandler):
         """处理回调消息"""
         try:
             incoming_message = ChatbotMessage.from_dict(callback_message.data)
-            self.channel.process_message(incoming_message)
+            self.channel.worker_pool.submit(self.channel.process_message, incoming_message)
             return AckMessage.STATUS_OK, "ok"
         except Exception as e:
             self.logger.error(f"[DingtalkCallbackHandler] Error: {e}")

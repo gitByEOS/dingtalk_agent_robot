@@ -1,53 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DingTalk Stream 服务 - 接收消息并调用 agent.py 处理
+钉钉服务编排层。
 
-使用 dingtalk_stream SDK 连接钉钉 Stream 服务。
+职责：
+1. 处理消息去重
+2. 处理多人会话隔离
+3. 调用 agent.py
+4. 记录交互日志
+5. 协调 channel 完成回复和表情 ACK
 """
 
 import os
 import subprocess
 import time
 import logging
-from typing import Optional
+import threading
+from typing import Dict
 
-import dingtalk_stream
-from dingtalk_stream import (
-    DingTalkStreamClient,
-    Credential,
-    AsyncChatbotHandler,
-    ChatbotMessage,
-    AckMessage,
-)
-
-
+from dingtalk_channel import DingtalkChannel, Envelope
 from logger import log_interaction
-from dingtalk_utils import send_emotion, send_markdown
 
 logger = logging.getLogger(__name__)
+DEDUP_TTL_MS = 5 * 60 * 1000
 
 
 class DingTalkService:
-    """钉钉 Stream 服务"""
+    """钉钉服务编排层"""
 
     def __init__(self, client_id: str, client_secret: str, agent_script: str = "agent.py"):
-        self.client_id = client_id
-        self.client_secret = client_secret
         self.agent_script = agent_script
-        self.seen_messages: dict = {}  # msgId -> timestamp
-        self.webhooks: dict = {}  # conversationId -> sessionWebhook
-        self.dedup_ttl_ms = 5 * 60 * 1000  # 5 分钟
-
-        # 创建 Stream 客户端
-        self.credential = Credential(client_id, client_secret)
-        self.client = DingTalkStreamClient(self.credential, logger)
-
-        # 注册回调处理器
-        self.handler = ServiceChatbotHandler(self)
-        self.client.register_callback_handler(
-            dingtalk_stream.ChatbotMessage.TOPIC,
-            self.handler
+        self.seen_messages: Dict[str, int] = {}
+        self.session_locks: Dict[str, threading.Lock] = {}
+        self.state_lock = threading.Lock()
+        self.channel = DingtalkChannel(
+            client_id=client_id,
+            client_secret=client_secret,
+            message_handler=self.handle_envelope,
+            logger=logger,
         )
 
     def call_agent(self, message: str) -> str:
@@ -71,111 +61,96 @@ class DingTalkService:
         except Exception as e:
             return f"处理异常: {e}"
 
-    def dedup_check(self, msg_id: str) -> bool:
-        """消息去重检查，返回 True 表示已处理过"""
-        if msg_id in self.seen_messages:
-            return True
-        self.seen_messages[msg_id] = time.time() * 1000
-        return False
+    def _cleanup_dedup_locked(self, now_ms: int):
+        """清理过期去重记录"""
+        expired_ids = [
+            msg_id
+            for msg_id, seen_at in self.seen_messages.items()
+            if now_ms - seen_at > DEDUP_TTL_MS
+        ]
+        for msg_id in expired_ids:
+            self.seen_messages.pop(msg_id, None)
 
-    def get_access_token(self) -> Optional[str]:
-        """获取钉钉 Access Token"""
-        return self.client.get_access_token()
+    def _is_duplicate(self, msg_id: str) -> bool:
+        """检查消息是否重复"""
+        now_ms = int(time.time() * 1000)
+        with self.state_lock:
+            self._cleanup_dedup_locked(now_ms)
+            if msg_id in self.seen_messages:
+                return True
+            self.seen_messages[msg_id] = now_ms
+            return False
 
-    def process_message(self, incoming_message: ChatbotMessage):
-        """处理接收到的消息"""
-        import re
+    def _get_session_key(self, envelope: Envelope) -> str:
+        """获取会话隔离键"""
+        return envelope.chat_id or envelope.sender_id or "default"
 
-        msg_id = incoming_message.message_id
-        conversation_id = incoming_message.conversation_id
-        session_webhook = incoming_message.session_webhook
-        sender_nick = incoming_message.sender_nick or "Unknown"
-        is_group = incoming_message.conversation_type == '2'
-        is_mentioned = bool(incoming_message.is_in_at_list)
+    def _get_session_lock(self, session_key: str) -> threading.Lock:
+        """按会话获取串行锁"""
+        with self.state_lock:
+            lock = self.session_locks.get(session_key)
+            if lock is None:
+                lock = threading.Lock()
+                self.session_locks[session_key] = lock
+            return lock
 
-        # 去重检查
-        if msg_id and self.dedup_check(msg_id):
-            logger.info(f"[DingTalk] 重复消息 {msg_id}, 跳过")
+    def handle_envelope(self, envelope: Envelope):
+        """处理 channel 转发过来的标准消息"""
+        if envelope.message_id and self._is_duplicate(envelope.message_id):
+            logger.info(f"[DingTalk] 重复消息 {envelope.message_id}, 跳过")
             return
 
-        # 缓存 webhook
-        if conversation_id and session_webhook:
-            self.webhooks[conversation_id] = session_webhook
+        session_key = self._get_session_key(envelope)
+        session_lock = self._get_session_lock(session_key)
+        with session_lock:
+            self._process_envelope(envelope)
 
-        # 提取消息内容
-        text = ""
-        msg_type = incoming_message.message_type
+    def process_message(self, envelope: Envelope):
+        """兼容旧接口，转发到新的编排入口"""
+        self.handle_envelope(envelope)
 
-        if msg_type == 'text' and incoming_message.text:
-            text = incoming_message.text.content or ""
-        elif msg_type == 'richText' and incoming_message.rich_text_content:
-            for part in incoming_message.rich_text_content.rich_text_list:
-                if 'text' in part:
-                    text += part.get("text", "")
-        else:
-            text = f"[{msg_type}]"
+    def _process_envelope(self, envelope: Envelope):
+        """在会话锁内处理消息"""
+        logger.info(f"[DingTalk] 收到消息: {envelope.sender_name} -> {envelope.text[:50]}...")
 
-        # 去除 @机器人
-        if is_mentioned:
-            text = re.sub(r'@\S+', '', text).strip()
-
-        logger.info(f"[DingTalk] 收到消息: {sender_nick} -> {text[:50]}...")
-
-        # 添加表情表示正在处理
-        token = self.get_access_token()
-        if token and msg_id and conversation_id:
-            send_emotion(token, self.client_id, msg_id, conversation_id, "reply")
-
-        # 调用 agent
         start_time = time.time()
-        reply = self.call_agent(text)
+        reply = ""
+        if envelope.conversation_id:
+            self.channel.attach_reaction(envelope.message_id, envelope.conversation_id)
+
+        try:
+            reply = self.call_agent(envelope.text)
+        except Exception as e:
+            logger.error(f"[DingTalk] 调用 agent 异常: {e}")
+            reply = f"处理异常: {e}"
+        finally:
+            if envelope.conversation_id:
+                self.channel.recall_reaction(envelope.message_id, envelope.conversation_id)
+
         duration_ms = int((time.time() - start_time) * 1000)
 
-        # 移除表情
-        if token and msg_id and conversation_id:
-            send_emotion(token, self.client_id, msg_id, conversation_id, "recall")
-
-        # 记录交互日志
         log_interaction(
-            user_id=incoming_message.sender_staff_id or incoming_message.sender_id or "unknown",
-            user_name=sender_nick,
-            msg_id=msg_id or "",
-            chat_id=conversation_id or session_webhook or "",
-            is_group=is_group,
-            is_mentioned=is_mentioned,
-            user_input=text,
+            user_id=envelope.sender_id or "unknown",
+            user_name=envelope.sender_name,
+            msg_id=envelope.message_id or "",
+            chat_id=envelope.chat_id,
+            is_group=envelope.is_group,
+            is_mentioned=envelope.is_mentioned,
+            user_input=envelope.text,
             agent_reply=reply,
-            duration_ms=duration_ms
+            duration_ms=duration_ms,
         )
 
-        # 发送回复
-        if session_webhook:
-            send_markdown(session_webhook, reply)
+        if self.channel.reply(envelope, reply):
             logger.info(f"[DingTalk] 已回复: {reply[:50]}...")
         else:
-            logger.warning(f"[DingTalk] 无 sessionWebhook, 无法回复")
+            logger.warning("[DingTalk] 回复失败，未找到可用 webhook")
 
     def connect(self):
         """连接钉钉 Stream"""
         logger.info("[DingTalk] 服务启动，连接 Stream...")
-        self.client.start_forever()
+        self.channel.connect()
 
-
-class ServiceChatbotHandler(AsyncChatbotHandler):
-    """自定义回调处理器 - 使用线程池处理阻塞操作"""
-
-    def __init__(self, service: DingTalkService):
-        super().__init__(max_workers=4)
-        self.service = service
-
-    def process(self, callback_message):
-        """处理回调消息（非 async，在线程池中执行）"""
-        try:
-            incoming_message = ChatbotMessage.from_dict(callback_message.data)
-            self.service.process_message(incoming_message)
-            return AckMessage.STATUS_OK, "ok"
-        except Exception as e:
-            self.logger.error(f"[Handler] 处理异常: {e}")
-            return AckMessage.STATUS_NOT_IMPLEMENT, str(e)
-
-
+    def disconnect(self):
+        """断开底层 channel"""
+        self.channel.disconnect()
