@@ -9,6 +9,8 @@ import sys
 import logging
 from dotenv import load_dotenv
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 load_dotenv('.env')
 
 from channels.dingtalk.channel import DingtalkChannel, Envelope
