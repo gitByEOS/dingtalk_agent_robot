@@ -1,71 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DingTalk 工具函数
+Markdown 格式化工具
 
-包含：
-- send_emotion: 发送表情回复
-- send_markdown: 发送 Markdown 消息
-- send_text_message: 发送纯文本消息
-- normalize_dingtalk_markdown: 完整 Markdown 格式化流程
-- split_chunks: 消息分块
-- convert_tables: 表格转换
-- extract_title: 提取标题
+可复用于其他 channel（飞书、企微等）
 """
 
-import json
 import re
-import requests
 import unicodedata
-from typing import Optional, List
 
-# 表情 API 常量
-EMOTION_API = "https://api.dingtalk.com/v1.0/robot/emotion"
-ACK_REACTION_NAME = "get✓" #👀
-ACK_EMOTION_ID = "2659900"
-ACK_EMOTION_BG_ID = "im_bg_2"
-
-# 消息限制
 CHUNK_LIMIT = 3800
-
-
-def send_emotion(
-    access_token: str,
-    robot_code: str,
-    msg_id: str,
-    conversation_id: str,
-    action: str = "reply"
-) -> bool:
-    """发送表情回复"""
-    if not access_token or not robot_code or not msg_id or not conversation_id:
-        return False
-
-    try:
-        resp = requests.post(
-            f"{EMOTION_API}/{action}",
-            headers={
-                "x-acs-dingtalk-access-token": access_token,
-                "Content-Type": "application/json"
-            },
-            json={
-                "robotCode": robot_code,
-                "openMsgId": msg_id,
-                "openConversationId": conversation_id,
-                "emotionType": 2,
-                "emotionName": ACK_REACTION_NAME,
-                "textEmotion": {
-                    "emotionId": ACK_EMOTION_ID,
-                    "emotionName": ACK_REACTION_NAME,
-                    "text": ACK_REACTION_NAME,
-                    "backgroundId": ACK_EMOTION_BG_ID
-                }
-            },
-            timeout=10
-        )
-        return resp.status_code == 200
-    except Exception as e:
-        print(f"[DingTalk] 表情API异常: {e}")
-        return False
 
 
 def is_table_separator(line: str) -> bool:
@@ -114,7 +58,7 @@ def build_table_line(cells: list, widths: list) -> str:
 
 
 def render_table(lines: list) -> str:
-    """渲染表格为钉钉可稳定显示的代码块表格"""
+    """渲染表格为代码块表格"""
     rows = [
         parse_table_row(line)
         for line in lines
@@ -124,10 +68,7 @@ def render_table(lines: list) -> str:
         return ''
 
     column_count = max(len(row) for row in rows)
-    normalized_rows = [
-        row + [''] * (column_count - len(row))
-        for row in rows
-    ]
+    normalized_rows = [row + [''] * (column_count - len(row)) for row in rows]
     column_widths = [
         max(get_display_width(row[col]) for row in normalized_rows)
         for col in range(column_count)
@@ -136,16 +77,13 @@ def render_table(lines: list) -> str:
     rendered_lines = [build_table_line(normalized_rows[0], column_widths)]
     separator = "|-" + "-|-".join('-' * width for width in column_widths) + "-|"
     rendered_lines.append(separator)
-    rendered_lines.extend(
-        build_table_line(row, column_widths)
-        for row in normalized_rows[1:]
-    )
+    rendered_lines.extend(build_table_line(row, column_widths) for row in normalized_rows[1:])
 
     return "```text\n" + "\n".join(rendered_lines) + "\n```"
 
 
 def convert_tables(text: str) -> str:
-    """将 Markdown 表格转换为钉钉支持的格式"""
+    """将 Markdown 表格转换为代码块表格"""
     lines = text.split('\n')
     output = []
     i = 0
@@ -220,7 +158,7 @@ def is_markdown_block_line(line: str) -> bool:
 
 
 def normalize_line_breaks(text: str) -> str:
-    """补齐钉钉 Markdown 的显式换行"""
+    """补齐 Markdown 显式换行"""
     lines = text.split('\n')
     output = []
     in_code = False
@@ -248,59 +186,8 @@ def normalize_line_breaks(text: str) -> str:
     return '\n'.join(output)
 
 
-def normalize_dingtalk_markdown(text: str) -> list:
+def normalize_markdown(text: str) -> list:
     """完整 Markdown 格式化流程"""
     converted = convert_tables(text)
     normalized = normalize_line_breaks(converted)
     return split_chunks(normalized)
-
-
-def send_markdown(webhook: str, text: str, title: Optional[str] = None) -> bool:
-    """通过 Webhook 发送 Markdown 消息"""
-    chunks = normalize_dingtalk_markdown(text)
-    msg_title = title or extract_title(text)
-
-    for i, chunk in enumerate(chunks):
-        body = {
-            "msgtype": "markdown",
-            "markdown": {
-                "title": f"{msg_title} (cont.)" if len(chunks) > 1 and i > 0 else msg_title,
-                "text": chunk
-            }
-        }
-
-        try:
-            resp = requests.post(
-                webhook,
-                headers={"Content-Type": "application/json"},
-                data=json.dumps(body),
-                timeout=10
-            )
-            if resp.status_code != 200:
-                print(f"[DingTalk] 发送失败: HTTP {resp.status_code} {resp.text}")
-                return False
-        except Exception as e:
-            print(f"[DingTalk] 发送异常: {e}")
-            return False
-
-    return True
-
-
-def send_text_message(webhook: str, text: str) -> bool:
-    """通过 Webhook 发送纯文本消息"""
-    body = {
-        "msgtype": "text",
-        "text": {"content": text}
-    }
-
-    try:
-        resp = requests.post(
-            webhook,
-            headers={"Content-Type": "application/json"},
-            data=json.dumps(body),
-            timeout=10
-        )
-        return resp.status_code == 200
-    except Exception as e:
-        print(f"[DingTalk] 发送异常: {e}")
-        return False

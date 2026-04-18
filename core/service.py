@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-钉钉服务编排层。
+服务编排层
 
 职责：
-1. 处理消息去重
-2. 处理多人会话隔离
-3. 调用 agent.py
+1. 消息去重
+2. 会话隔离
+3. 调用 Agent
 4. 记录交互日志
-5. 协调 channel 完成回复和表情 ACK
+5. 协调 Channel 完成回复和表情
 """
 
 import os
@@ -18,15 +18,15 @@ import logging
 import threading
 from typing import Dict
 
-from dingtalk_channel import DingtalkChannel, Envelope
-from logger import log_interaction
+from channels.dingtalk.channel import DingtalkChannel, Envelope
+from core.logger import log_interaction
 
 logger = logging.getLogger(__name__)
 DEDUP_TTL_MS = 5 * 60 * 1000
 
 
-class DingTalkService:
-    """钉钉服务编排层"""
+class Service:
+    """服务编排层"""
 
     def __init__(self, client_id: str, client_secret: str, agent_script: str = "agent.py"):
         self.agent_script = agent_script
@@ -41,7 +41,7 @@ class DingTalkService:
         )
 
     def call_agent(self, message: str) -> str:
-        """调用 agent.py 处理消息"""
+        """调用 Agent 处理消息"""
         try:
             result = subprocess.run(
                 ["python3", self.agent_script, "-i", message],
@@ -95,9 +95,9 @@ class DingTalkService:
             return lock
 
     def handle_envelope(self, envelope: Envelope):
-        """处理 channel 转发过来的标准消息"""
+        """处理标准消息信封"""
         if envelope.message_id and self._is_duplicate(envelope.message_id):
-            logger.info(f"[DingTalk] 重复消息 {envelope.message_id}, 跳过")
+            logger.info(f"重复消息 {envelope.message_id}, 跳过")
             return
 
         session_key = self._get_session_key(envelope)
@@ -105,13 +105,9 @@ class DingTalkService:
         with session_lock:
             self._process_envelope(envelope)
 
-    def process_message(self, envelope: Envelope):
-        """兼容旧接口，转发到新的编排入口"""
-        self.handle_envelope(envelope)
-
     def _process_envelope(self, envelope: Envelope):
         """在会话锁内处理消息"""
-        logger.info(f"[DingTalk] 收到消息: {envelope.sender_name} -> {envelope.text[:50]}...")
+        logger.info(f"收到消息: {envelope.sender_name} -> {envelope.text[:50]}...")
 
         start_time = time.time()
         reply = ""
@@ -121,7 +117,7 @@ class DingTalkService:
         try:
             reply = self.call_agent(envelope.text)
         except Exception as e:
-            logger.error(f"[DingTalk] 调用 agent 异常: {e}")
+            logger.error(f"调用 Agent 异常: {e}")
             reply = f"处理异常: {e}"
         finally:
             if envelope.conversation_id:
@@ -142,15 +138,15 @@ class DingTalkService:
         )
 
         if self.channel.reply(envelope, reply):
-            logger.info(f"[DingTalk] 已回复: {reply[:50]}...")
+            logger.info(f"已回复: {reply[:50]}...")
         else:
-            logger.warning("[DingTalk] 回复失败，未找到可用 webhook")
+            logger.warning("回复失败，未找到可用 webhook")
 
     def connect(self):
-        """连接钉钉 Stream"""
-        logger.info("[DingTalk] 服务启动，连接 Stream...")
+        """连接 Channel"""
+        logger.info("服务启动，连接 Channel...")
         self.channel.connect()
 
     def disconnect(self):
-        """断开底层 channel"""
+        """断开 Channel"""
         self.channel.disconnect()

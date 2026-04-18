@@ -12,7 +12,7 @@ import argparse
 from dotenv import load_dotenv
 
 # 在导入其他模块前，优先加载环境变量和配置日志
-load_dotenv('.env.dingtalk')
+load_dotenv('.env')
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,7 +23,8 @@ logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 logger = logging.getLogger('launch')
 
-from dingtalk_service import DingTalkService
+from core.service import Service
+
 
 def main():
     parser = argparse.ArgumentParser(description="钉钉 Stream 服务")
@@ -39,7 +40,7 @@ def main():
 
     logger.info(f"启动服务, Client ID: {args.client_id}")
 
-    service = DingTalkService(
+    service = Service(
         client_id=args.client_id,
         client_secret=args.client_secret,
         agent_script=args.agent

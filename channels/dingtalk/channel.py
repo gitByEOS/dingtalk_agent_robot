@@ -11,8 +11,6 @@ DingTalk Channel - 钉钉机器人适配器
 5. 引用消息上下文提取
 6. 表情回复（👀 表示正在处理）
 7. Webhook 缓存用于回复消息
-
-参考: dingtalk-js/src/DingtalkAdapter.ts
 """
 
 import re
@@ -29,7 +27,7 @@ from typing import Optional, Dict, List, Any, Callable
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
 
-from dingtalk_utils import send_emotion, send_markdown, send_text_message
+from channels.dingtalk.utils import send_emotion, send_markdown, send_text_message
 import dingtalk_stream
 from dingtalk_stream import (
     DingTalkStreamClient,
@@ -50,9 +48,6 @@ MSGTYPE_HANDLERS = {
     'audio': lambda c: (c.get('recognition') or '(audio)', [c.get('downloadCode')], 'audio', None),
     'video': lambda c: ('(video)', [c.get('downloadCode')], 'video', None),
 }
-
-
-# --- 数据结构 ---
 
 
 @dataclass
@@ -90,9 +85,6 @@ class Envelope:
     attachments: List[Attachment] = field(default_factory=list)
 
 
-# --- 媒体下载 ---
-
-
 def download_media(download_code: str, robot_code: str, access_token: str) -> Optional[MediaFile]:
     """下载钉钉媒体文件"""
     if not download_code or not robot_code or not access_token:
@@ -123,9 +115,6 @@ def download_media(download_code: str, robot_code: str, access_token: str) -> Op
         return MediaFile(data=file_resp.content, mime_type=file_resp.headers.get("Content-Type", "application/octet-stream"))
     except Exception:
         return None
-
-
-# --- DingtalkChannel ---
 
 
 class DingtalkChannel:
@@ -408,7 +397,7 @@ class DingtalkCallbackHandler(ChatbotHandler):
         super().__init__()
         self.channel = channel
 
-    def process(self, callback_message: CallbackMessage):
+    async def process(self, callback_message: CallbackMessage):
         try:
             incoming_message = ChatbotMessage.from_dict(callback_message.data)
             self.channel.worker_pool.submit(self.channel.process_message, incoming_message)
@@ -416,28 +405,3 @@ class DingtalkCallbackHandler(ChatbotHandler):
         except Exception as e:
             self.logger.error(f"[DingtalkCallbackHandler] Error: {e}")
             return AckMessage.STATUS_NOT_IMPLEMENT, str(e)
-
-
-# --- CLI ---
-
-
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="钉钉机器人消息发送工具")
-    parser.add_argument("-w", "--webhook", required=True, help="Webhook URL")
-    parser.add_argument("-m", "--message", required=True, help="消息内容")
-    parser.add_argument("-t", "--title", help="标题")
-    parser.add_argument("--type", choices=["markdown", "text"], default="markdown")
-
-    args = parser.parse_args()
-
-    if args.type == "markdown":
-        success = send_markdown(args.webhook, args.message, args.title)
-    else:
-        success = send_text_message(args.webhook, args.message)
-
-    print(f"发送{'成功' if success else '失败'}")
-
-
-if __name__ == "__main__":
-    main()
