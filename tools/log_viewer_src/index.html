@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>日志查看器 - Vite+</title>
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <h1>日志查看器</h1>
+        <div class="search-bar">
+          <input type="text" id="search-input" placeholder="搜索用户输入或回复..." />
+        </div>
+      </header>
+      <main class="container">
+        <aside class="sidebar">
+          <h2>用户列表</h2>
+          <ul id="user-list"></ul>
+        </aside>
+        <section class="content">
+          <div id="date-filter"></div>
+          <div id="log-container"></div>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

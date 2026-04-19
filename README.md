@@ -65,10 +65,14 @@ logs/
 ```
 
 查看日志：
-
+```
+open tools/log-viewer.html
+```
+或者
 ```bash
 python core/logger.py --dump LOG_DIR
 ```
+
 
 ## 流程
 ![workflow](./workflow.png)

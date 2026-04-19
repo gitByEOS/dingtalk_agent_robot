@@ -25,3 +25,7 @@ logs/
 
 # Claude
 .claude/
+
+# vite
+node_modules
+dist
